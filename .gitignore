@@ -5,3 +5,4 @@ data.json
 package*
 node_modules
 total*
+__pycache__
