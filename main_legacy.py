@@ -10,9 +10,23 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 import pyotp
 import os
-from sheets_auth_selector import load_clients_from_sheets
-from events_extractor import append_event_to_excel_by_sheet, log_failed_client, clean_excel_file
-import threading
+import logging
+
+# 에러 로그 생성 함수
+def setup_process_logger():
+    log_path = os.path.join(os.getcwd(), "process_error.log")
+
+    logger = logging.getLogger("process_error")
+    logger.setLevel(logging.ERROR)
+
+    if not logger.handlers:
+        handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
+    return logger
+
 
 # 카운트와 이벤트 리스트를 가져오는 함수
 def get_count_and_events(client, driver, section_name, count_xpath, button_xpath, tbody_xpath, detail_xpath):
@@ -31,7 +45,7 @@ def get_count_and_events(client, driver, section_name, count_xpath, button_xpath
             EC.element_to_be_clickable((By.XPATH, button_xpath))
         )
         button.click()
-        time.sleep(4)
+        time.sleep(2)
 
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, tbody_xpath)))
         rows = driver.find_elements(By.XPATH, f"{tbody_xpath}/tr")
@@ -50,7 +64,7 @@ def get_count_and_events(client, driver, section_name, count_xpath, button_xpath
                     print(f"클릭 실패: {event_title}, 오류: {str(e)}")
                     driver.save_screenshot(f"click_error_{event_title}.png")
                     raise
-                time.sleep(5)
+                time.sleep(2)
                 event_details = get_all_sub_texts(driver, detail_xpath)
                 
                 event_resources = get_affected_resources(client, driver)
@@ -62,11 +76,11 @@ def get_count_and_events(client, driver, section_name, count_xpath, button_xpath
                     "affected_resources": event_resources
                 })
                 
-                time.sleep(4)
+                time.sleep(1)
                 cancel_button_xpath = '/html/body/div[2]/div[2]/div/div[1]/div/div/div/main/div[2]/section/div/div[2]/div[1]/div/div/button[2]'
                 cancel_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, cancel_button_xpath)))
                 cancel_button.click()
-                time.sleep(5)
+                time.sleep(2)
 
     return count, events
 
@@ -182,7 +196,7 @@ def get_affected_resources(client, driver):
         EC.element_to_be_clickable((By.XPATH, affected_resources_tab_xpath))
     )
     affected_resources_button.click()
-    time.sleep(5)
+    time.sleep(2)
 
     affected_resources = []
     link_elements = driver.find_elements(By.XPATH, affected_resources_link_xpath)
@@ -213,7 +227,7 @@ def process_account(client, chromedriver_path):
         options.headless = False
         options.add_experimental_option("detach", True)
         options.add_argument('--start-maximized')
-        # options.add_argument('--headless')
+        options.add_argument('--headless')
         service = Service(executable_path=chromedriver_path)
         driver = webdriver.Chrome(service=service, options=options)
 
@@ -252,7 +266,7 @@ def process_account(client, chromedriver_path):
             all_events_button = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, all_events_button_xpath)))
             all_events_button.click()
 
-            time.sleep(5)
+            time.sleep(2)
             unresolved_issues_count_xpath = "/html/body/div[2]/div[2]/div/div[1]/div/div/div/main/div[1]/div/div/div[3]/div[1]/div[1]/div[2]/div/div[1]/div/ul/li[1]/div/a/span/span/span/span"
             unresolved_issues_button_xpath = "/html/body/div[2]/div[2]/div/div[1]/div/div/div/main/div[1]/div/div/div[3]/div[1]/div[1]/div[2]/div/div[1]/div/ul/li[1]/div/a"
             scheduled_changes_count_xpath = "/html/body/div[2]/div[2]/div/div[1]/div/div/div/main/div[1]/div/div/div[3]/div[1]/div[1]/div[2]/div/div[1]/div/ul/li[2]/div/a/span/span/span/span"
@@ -293,34 +307,37 @@ def process_account(client, chromedriver_path):
 
 # 메인 실행 로직
 def main():
-    # Google Sheets에서 데이터 로드
-    sheet_title = "PHD_고객사 목록"
-    clients = load_clients_from_sheets(sheet_title)
-    excel_write_lock = threading.Lock()
+    logger = setup_process_logger()
+    try:
+        # 기존 main 로직
+        clients = load_clients_from_sheets("시트명")
 
-    if not clients:
-        print("실행할 클라이언트 정보가 없습니다.")
-        return
+        chromedriver_path = os.path.join(os.getcwd(), "chromedriver.exe")
 
-    chromedriver_path = os.path.join(os.getcwd(), "chromedriver.exe")
-    results = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_client = {
+                executor.submit(process_account, client, chromedriver_path): client
+                for client in clients
+            }
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        future_to_client = {executor.submit(process_account, client, chromedriver_path): client for client in clients}
-        for future in as_completed(future_to_client):
-            client = future_to_client[future]
-            try:
-                result = future.result()
-                if "error" not in result:
-                    append_event_to_excel_by_sheet(excel_write_lock, result)
-                else:
-                    print(f"{client['name']} 실패: {result['error']}")
-                    log_failed_client(client['name'], result['error'])
-            except Exception as e:
-                print(f"{client['name']} 처리 중 예외 발생: {str(e)}")
-                log_failed_client(client['name'], str(e))
+            for future in as_completed(future_to_client):
+                client = future_to_client[future]
+                try:
+                    result = future.result()
+                    if "error" not in result:
+                        append_event_to_excel_by_sheet(result)
+                    else:
+                        print(f"{client['name']} 실패: {result['error']}")
+                        log_failed_client(client['name'], result['error'])
+                except Exception as e:
+                    log_failed_client(client['name'], str(e))
+                    logger.error(f"{client['name']} 처리 중 예외 발생", exc_info=True)
 
-    clean_excel_file()
+        clean_excel_file()
+
+    except Exception as e:
+        logger.error("전체 프로세스 중 예외 발생", exc_info=True)
+        print("치명적인 에러가 발생했습니다. 로그를 확인해주세요.")
 
 if __name__ == "__main__":
     main()
